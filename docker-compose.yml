@@ -1,17 +1,16 @@
-version: "3.9"
-
 services:
   torrent-stream:
     container_name: torrent_stream_server
-    image: torrent-stream-app:latest
     build:
       context: .
       dockerfile: Dockerfile
     restart: unless-stopped
     environment:
-      NODE_ENV: ${NODE_ENV}
-      PORT: ${PORT}
-      OPENSUBTITLES_API_KEY: ${OPENSUBTITLES_API_KEY}
+      NODE_ENV: production
+      PORT: 3050
+      OPENSUBTITLES_API_KEY: "RxPfsDLz24QZiE4A4WgwGE2XHcvz4Rng"
+      OPENSUBTITLES_USERNAME: "aung_hein"
+      OPENSUBTITLES_PASSWORD: "Aung2025"
     ports:
       - "3050:3050"
     networks:
