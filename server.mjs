@@ -1,36 +1,42 @@
 import express from "express";
 import WebTorrent from "webtorrent";
 import path from "path";
-import { fileURLToPath } from 'url';
-import os from 'os';
+import { fileURLToPath } from "url";
+import os from "os";
 import cors from "cors";
 import NodeCache from "node-cache";
+import fetch from "node-fetch";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
 
+// --- Middleware ---
 app.use(cors());
 app.use(express.json());
 
+// --- WebTorrent Client ---
 const client = new WebTorrent({
-  maxConns: 50,
-  nodeId: undefined,
-  peerId: undefined,
+  maxConns: 20,
   tracker: true,
-  dht: true,
+  dht: false,
   webSeeds: true,
-  path: path.join(os.tmpdir(), 'webtorrent', 'tmp'),
+  path: path.join(os.tmpdir(), "webtorrent", "tmp"),
 });
 
 // --- Caches ---
-const torrentMap = new Map(); 
-const subtitleCache = new NodeCache({ stdTTL: 86400 }); // 24 hours TTL
+const torrentMap = new Map();
+const subtitleCache = new NodeCache({ stdTTL: 86400 }); // 24 hours
 
-const OPENSUBTITLES_API_KEY = "RxPfsDLz24QZiE4A4WgwGE2XHcvz4Rng";
+// --- Environment Variables ---
+const {
+  OPENSUBTITLES_API_KEY = "RxPfsDLz24QZiE4A4WgwGE2XHcvz4Rng",
+  NODE_ENV = "development",
+  PORT = 3050,
+} = process.env;
 
-// Rate limiting
+// --- Rate Limiting ---
 const requestCounts = new Map();
 const RATE_LIMIT = 200;
 const RATE_LIMIT_WINDOW = 60 * 1000;
@@ -41,7 +47,7 @@ function rateLimit(req, res, next) {
   const windowStart = now - RATE_LIMIT_WINDOW;
 
   if (!requestCounts.has(ip)) requestCounts.set(ip, []);
-  const requests = requestCounts.get(ip).filter(time => time > windowStart);
+  const requests = requestCounts.get(ip).filter((t) => t > windowStart);
   requests.push(now);
   requestCounts.set(ip, requests);
 
@@ -54,9 +60,9 @@ function rateLimit(req, res, next) {
 app.use(rateLimit);
 
 // --- Torrent Management ---
-function getTorrent(torrentUrl) {
+async function getTorrent(torrentUrl) {
   return new Promise((resolve, reject) => {
-    const cacheKey = `torrent_${Buffer.from(torrentUrl).toString('base64')}`;
+    const cacheKey = Buffer.from(torrentUrl).toString("base64");
 
     if (torrentMap.has(cacheKey)) {
       const cached = torrentMap.get(cacheKey);
@@ -65,205 +71,183 @@ function getTorrent(torrentUrl) {
     }
 
     const torrent = client.add(torrentUrl, {
-      path: path.join(os.tmpdir(), 'webtorrent', Date.now().toString()),
-      storeCacheSlots: 30
+      path: path.join(os.tmpdir(), "webtorrent", Date.now().toString()),
     });
 
     const wrapper = { torrent, lastAccessed: Date.now() };
     torrentMap.set(cacheKey, wrapper);
 
-    torrent.on('ready', () => resolve(torrent));
-    torrent.on('error', (err) => {
-      console.error('Torrent error:', err);
+    torrent.on("ready", () => resolve(torrent));
+    torrent.on("error", (err) => {
+      console.error("Torrent error:", err);
       torrentMap.delete(cacheKey);
       reject(err);
     });
 
-    // Auto cleanup after 2 hours of inactivity
-    setTimeout(() => {
-      const t = torrentMap.get(cacheKey);
-      if (t && (Date.now() - t.lastAccessed > 2 * 60 * 60 * 1000)) {
-        t.torrent.destroy({ destroyStore: true });
-        torrentMap.delete(cacheKey);
+    // Periodic cleanup
+    setInterval(() => {
+      const now = Date.now();
+      for (const [key, { torrent, lastAccessed }] of torrentMap.entries()) {
+        if (now - lastAccessed > 15 * 60 * 1000) {
+          console.log("🧹 Cleaning up torrent:", torrent.name);
+          torrent.destroy({ destroyStore: true });
+          torrentMap.delete(key);
+        }
       }
-    }, 2 * 60 * 60 * 1000);
+    }, 10 * 60 * 1000);
   });
 }
 
-// --- Enhanced Subtitle Search with Duration Matching ---
-async function searchSubtitles(movieTitle, fileSize, imdbId, duration, lang = "eng") { 
+// --- Subtitle Search ---
+async function searchSubtitles(movieTitle, fileSize, imdbId, duration, lang = "eng") {
   const cacheKey = `subs_${imdbId}_${lang}_${fileSize}_${duration}`;
   const cached = subtitleCache.get(cacheKey);
   if (cached) return cached;
 
   try {
-    const searchParams = new URLSearchParams({
+    const params = new URLSearchParams({
       languages: lang,
-      order_by: 'download_count',
-      order_direction: 'desc'
+      order_by: "download_count",
+      order_direction: "desc",
     });
 
     if (imdbId) {
-      searchParams.append('imdb_id', imdbId.replace('tt', '')); 
+      params.append("imdb_id", imdbId.replace("tt", ""));
     } else {
-      searchParams.append('query', movieTitle);
+      params.append("query", movieTitle);
     }
 
-    const searchResponse = await fetch(`https://api.opensubtitles.com/api/v1/subtitles?${searchParams}`, {
-      headers: {  
-        'Api-Key': OPENSUBTITLES_API_KEY,
-        'User-Agent': 'StreamFlix v1.0'
-      }
+    const res = await fetch(`https://api.opensubtitles.com/api/v1/subtitles?${params}`, {
+      headers: {
+        "Api-Key": OPENSUBTITLES_API_KEY,
+        "User-Agent": "StreamFlix v1.0",
+      },
     });
 
-    if (!searchResponse.ok) {
-      console.error("OpenSubtitles Search Response:", await searchResponse.text());
-      throw new Error('OpenSubtitles API search failed');
-    }
+    if (!res.ok) throw new Error("OpenSubtitles API failed");
+    const data = await res.json();
+    if (!data.data?.length) return null;
 
-    const searchData = await searchResponse.json();
-    
-    if (searchData.data && searchData.data.length > 0) {
-      // Enhanced matching algorithm with duration consideration
-      let bestMatch = findBestSubtitleMatch(searchData.data, fileSize, duration);
-      
-      if (bestMatch) {
-        const downloadResponse = await fetch(`https://api.opensubtitles.com/api/v1/download`, {
-          method: 'POST',
-          headers: {  
-            'Api-Key': OPENSUBTITLES_API_KEY,
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({ file_id: bestMatch.attributes.files[0].file_id })
-        });
+    const bestMatch = findBestSubtitleMatch(data.data, fileSize, duration);
+    if (!bestMatch) return null;
 
-        const downloadData = await downloadResponse.json();
-        if (downloadData.link) {
-          const subtitleContent = await fetch(downloadData.link);
-          let text = await subtitleContent.text();
-          
-          if (downloadData.link.endsWith(".srt")) {
-            text = convertSrtToVtt(text);
-          }
-          
-          subtitleCache.set(cacheKey, text);
-          return text;
-        }
-      }
-    }
+    const dlRes = await fetch(`https://api.opensubtitles.com/api/v1/download`, {
+      method: "POST",
+      headers: {
+        "Api-Key": OPENSUBTITLES_API_KEY,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ file_id: bestMatch.attributes.files[0].file_id }),
+    });
+
+    const dlData = await dlRes.json();
+    if (!dlData.link) return null;
+
+    const text = await (await fetch(dlData.link)).text();
+    const vttText = dlData.link.endsWith(".srt") ? convertSrtToVtt(text) : text;
+
+    subtitleCache.set(cacheKey, vttText);
+    return vttText;
   } catch (error) {
-    console.error('Subtitle search error:', error);
+    console.error("Subtitle search error:", error);
+    return null;
   }
-
-  return null;
 }
 
-// --- Enhanced Subtitle Matching Algorithm ---
 function findBestSubtitleMatch(subtitles, fileSize, duration) {
-  if (!subtitles || subtitles.length === 0) return null;
+  let best = null;
+  let score = -Infinity;
 
-  let bestMatch = null;
-  let bestScore = -Infinity;
+  for (const s of subtitles) {
+    let current = 0;
 
-  for (const subtitle of subtitles) {
-    let score = 0;
+    if (s.attributes.movie_hash_match) current += 1000;
 
-    // 1. Hash match (highest priority)
-    if (subtitle.attributes.movie_hash_match) {
-      score += 1000;
+    if (duration && s.attributes.movie_time_ms) {
+      const subDur = s.attributes.movie_time_ms / 1000;
+      const diff = Math.abs(duration - subDur);
+      if (diff < 60) current += 500;
+      else if (diff < 300) current += 200;
+      else if (diff < 600) current += 50;
     }
 
-    // 2. Duration matching (new - very important)
-    if (duration && subtitle.attributes.movie_time_ms) {
-      const subtitleDuration = subtitle.attributes.movie_time_ms / 1000; // Convert to seconds
-      const durationDiff = Math.abs(duration - subtitleDuration);
-      
-      // Higher score for closer duration matches
-      if (durationDiff < 60) { // Within 1 minute
-        score += 500;
-      } else if (durationDiff < 300) { // Within 5 minutes
-        score += 200;
-      } else if (durationDiff < 600) { // Within 10 minutes
-        score += 50;
-      }
-      
-      // Bonus for exact duration match
-      if (durationDiff < 10) {
-        score += 300;
-      }
+    if (fileSize && s.attributes.size) {
+      const ratio =
+        Math.min(fileSize, s.attributes.size) /
+        Math.max(fileSize, s.attributes.size);
+      if (ratio > 0.95) current += 300;
+      else if (ratio > 0.9) current += 150;
+      else if (ratio > 0.8) current += 50;
     }
 
-    // 3. File size matching
-    if (fileSize && subtitle.attributes.size) {
-      const sizeDiff = Math.abs(fileSize - subtitle.attributes.size);
-      const sizeRatio = Math.min(fileSize, subtitle.attributes.size) / Math.max(fileSize, subtitle.attributes.size);
-      
-      if (sizeRatio > 0.95) { // Within 5% size difference
-        score += 300;
-      } else if (sizeRatio > 0.90) { // Within 10% size difference
-        score += 150;
-      } else if (sizeRatio > 0.80) { // Within 20% size difference
-        score += 50;
-      }
-    }
+    if (s.attributes.download_count)
+      current += Math.log10(s.attributes.download_count + 1) * 10;
+    if (s.attributes.fps) current += 20;
+    if (s.attributes.format === "srt") current += 10;
 
-    // 4. Download count (popularity)
-    if (subtitle.attributes.download_count) {
-      score += Math.log10(subtitle.attributes.download_count + 1) * 10;
-    }
-
-    // 5. Frame rate matching
-    if (subtitle.attributes.fps) {
-      score += 20; // Bonus for having FPS info
-    }
-
-    // 6. Format preferences
-    if (subtitle.attributes.format === 'srt') {
-      score += 10; // Prefer SRT format
-    }
-
-    if (score > bestScore) {
-      bestScore = score;
-      bestMatch = subtitle;
+    if (current > score) {
+      score = current;
+      best = s;
     }
   }
 
-  console.log(`Best subtitle match score: ${bestScore}`);
-  return bestMatch;
+  return best;
 }
 
-// --- Stream Route ---
+// --- Helpers ---
+function convertSrtToVtt(srt) {
+  return (
+    "WEBVTT\n\n" +
+    srt
+      .replace(/<[^>]*>/g, "")
+      .replace(/{[^}]*}/g, "")
+      .replace(/^\s*\d+\s*[\r\n]/gm, "")
+      .replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, "$1.$2")
+      .replace(/\r\n/g, "\n")
+      .trim()
+  );
+}
+
+function applyTimeOffset(vtt, offsetSeconds) {
+  if (!offsetSeconds) return vtt;
+
+  const regex = /(\d{1,2}:\d{2}:\d{2}\.\d{3})/g;
+  return vtt.replace(regex, (match) => {
+    const parts = match.split(/[:.]/).map(Number);
+    const total = parts[0] * 3600 + parts[1] * 60 + parts[2] + parts[3] / 1000;
+    const newTime = Math.max(0, total + offsetSeconds);
+
+    const h = String(Math.floor(newTime / 3600)).padStart(2, "0");
+    const m = String(Math.floor((newTime % 3600) / 60)).padStart(2, "0");
+    const s = String(Math.floor(newTime % 60)).padStart(2, "0");
+    const ms = String(Math.floor((newTime % 1) * 1000)).padStart(3, "0");
+    return `${h}:${m}:${s}.${ms}`;
+  });
+}
+
+// --- Routes ---
 app.get("/stream", async (req, res) => {
   try {
-    const torrentUrl = req.query.torrent;
+    const { torrent: torrentUrl } = req.query;
     if (!torrentUrl) return res.status(400).json({ error: "No torrent URL" });
 
     const torrent = await getTorrent(torrentUrl);
-    const file = torrent.files.find(f =>
-      /\.(mp4|mkv|avi|mov|wmv|flv|webm)$/i.test(f.name)
-    ) || torrent.files[0];
-
-    if (!file) return res.status(404).json({ error: "No video file in torrent" });
+    const file =
+      torrent.files.find((f) => /\.(mp4|mkv|avi|mov|webm)$/i.test(f.name)) ||
+      torrent.files[0];
+    if (!file) return res.status(404).json({ error: "No video file found" });
 
     const range = req.headers.range;
     const fileSize = file.length;
 
     if (!range) {
       res.setHeader("Content-Type", "video/mp4");
-      const stream = file.createReadStream();
-      stream.on("error", () => {});
-      res.on("close", () => stream.destroy());
-      return stream.pipe(res);
+      return file.createReadStream().pipe(res);
     }
 
     const [startStr, endStr] = range.replace(/bytes=/, "").split("-");
     const start = parseInt(startStr, 10);
     const end = endStr ? parseInt(endStr, 10) : fileSize - 1;
-
-    if (start >= fileSize || end >= fileSize) {
-      res.status(416).setHeader("Content-Range", `bytes */${fileSize}`);
-      return res.end();
-    }
 
     const chunkSize = end - start + 1;
     res.writeHead(206, {
@@ -271,161 +255,52 @@ app.get("/stream", async (req, res) => {
       "Accept-Ranges": "bytes",
       "Content-Length": chunkSize,
       "Content-Type": "video/mp4",
-      "Cache-Control": "public, max-age=3600"
     });
 
-    const stream = file.createReadStream({ start, end });
-    stream.on("error", () => {});
-    res.on("close", () => stream.destroy());
-    stream.pipe(res);
-  } catch (error) {
-    console.error('Stream error:', error);
-    res.status(500).json({ error: "Stream error" });
+    file.createReadStream({ start, end }).pipe(res);
+  } catch (err) {
+    console.error("Stream error:", err);
+    res.status(500).json({ error: "Stream failed" });
   }
 });
 
-// --- Enhanced Subtitles Route with Duration ---
 app.get("/subs", async (req, res) => {
   try {
-    const { torrent: torrentUrl, lang = "eng", imdbId, offset, duration } = req.query; 
-    if (!torrentUrl) return res.status(400).json({ error: "No torrent URL" });
+    const { torrent, lang = "eng", imdbId, offset, duration } = req.query;
+    if (!torrent) return res.status(400).json({ error: "Missing torrent" });
 
-    const torrent = await getTorrent(torrentUrl);
-    const file = torrent.files.find(f =>
-      /\.(mp4|mkv|avi|mov|wmv|flv|webm)$/i.test(f.name)
-    ) || torrent.files[0];
+    const t = await getTorrent(torrent);
+    const f =
+      t.files.find((f) => /\.(mp4|mkv|avi|mov|webm)$/i.test(f.name)) || t.files[0];
+    if (!f) return res.status(404).json({ error: "No video file" });
 
-    if (!file) return res.status(404).json({ error: "No video file" });
-
-    // Parse duration to number
-    const videoDuration = duration ? parseFloat(duration) : null;
-
-    let subtitleContent = await searchSubtitles(
-      file.name,
-      file.length,
+    const sub = await searchSubtitles(
+      f.name,
+      f.length,
       imdbId,
-      videoDuration,
+      parseFloat(duration) || null,
       lang
     );
+    if (!sub) return res.status(404).json({ error: "No subtitles found" });
 
-    if (subtitleContent) {
-      const offsetSeconds = parseFloat(offset) || 0;
-      
-      // Apply time offset
-      subtitleContent = applyTimeOffset(subtitleContent, offsetSeconds);
-
-      res.setHeader("Content-Type", "text/vtt");
-      res.setHeader("Cache-Control", "public, max-age=86400");
-      return res.send(subtitleContent);
-    }
-
-    res.status(404).json({ error: "No subtitles found" });
-  } catch (error) {
-    console.error('Subtitles error:', error);
-    res.status(500).json({ error: "Subtitles error" });
+    const adjusted = applyTimeOffset(sub, parseFloat(offset) || 0);
+    res.setHeader("Content-Type", "text/vtt");
+    res.send(adjusted);
+  } catch (e) {
+    console.error("Subtitles error:", e);
+    res.status(500).json({ error: "Subtitle error" });
   }
 });
 
-app.get("/stream/status", async (req, res) => {
-  const torrentUrl = req.query.torrent;
-  const torrent = client.get(torrentUrl);
-
-  if (!torrent) {
-    return res.json({ status: "loading" });
-  }
-
-  const file = torrent.files.find(f => f.name.endsWith(".mp4") || f.name.endsWith(".mkv"));
-  if (!file) {
-    return res.json({ status: "no-file" });
-  }
-
-  return res.json({ status: "ready" });
-});
-
-
-// --- Available Subtitle Languages ---
-app.get("/subs/languages", async (req, res) => {
-  try {
-    const englishLang = [{ code: "en", name: "English" }];
-    res.json(englishLang);
-  } catch (error) {
-    res.status(500).json({ error: "Failed to get languages" });
-  }
-});
-
-// --- Helpers ---
-
-// Time Offset Helper
-function applyTimeOffset(vttContent, offsetSeconds) {
-    if (offsetSeconds === 0 || typeof vttContent !== 'string') return vttContent;
-
-    const timeCodeRegex = /(\d{1,2}:\d{2}:\d{2}\.\d{3}|\d{1,2}:\d{2}\.\d{3})/g;
-
-    function timeToSeconds(timeStr) {
-        const parts = timeStr.split(/[:.]/).map(Number);
-        
-        let totalSeconds = 0;
-        let ms = parts.pop() / 1000;
-        
-        if (parts.length === 2) { // MM:SS
-            totalSeconds = parts[0] * 60 + parts[1];
-        } else if (parts.length === 3) { // HH:MM:SS
-            totalSeconds = parts[0] * 3600 + parts[1] * 60 + parts[2];
-        }
-        return totalSeconds + ms;
-    }
-
-    function secondsToTime(totalSeconds) {
-        if (totalSeconds < 0) totalSeconds = 0;
-
-        const ms = Math.floor((totalSeconds % 1) * 1000);
-        const totalSecs = Math.floor(totalSeconds);
-        
-        const secs = totalSecs % 60;
-        const mins = Math.floor((totalSecs / 60) % 60);
-        const hours = Math.floor(totalSecs / 3600);
-
-        const pad = (num, len = 2) => String(num).padStart(len, '0');
-
-        if (hours > 0) {
-            return `${pad(hours)}:${pad(mins)}:${pad(secs)}.${pad(ms, 3)}`;
-        }
-        return `${pad(mins)}:${pad(secs)}.${pad(ms, 3)}`;
-    }
-
-    return vttContent.replace(timeCodeRegex, (match) => {
-        const originalSeconds = timeToSeconds(match);
-        const newSeconds = originalSeconds + offsetSeconds;
-        return secondsToTime(newSeconds);
-    });
-}
-
-// VTT Conversion Helper
-function convertSrtToVtt(srt) {
-  let vtt = "WEBVTT\n\n";
-
-  vtt += srt
-    .replace(/<[^>]*>/g, "")
-    .replace(/{[^}]*}/g, "")
-    .replace(/^\s*\d+\s*[\r\n]/gm, "") 
-    .replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, "$1.$2")
-    .replace(/\r\n/g, "\n")
-    .trim();
-
-  return vtt;
-}
-
-// --- Health Check ---
 app.get("/health", (req, res) => {
-  res.json({ 
-    status: "healthy", 
+  res.json({
+    status: "healthy",
     torrents: client.torrents.length,
     memory: process.memoryUsage(),
-    uptime: process.uptime()
+    uptime: process.uptime(),
   });
 });
 
-const PORT = process.env.PORT || 3050;
 app.listen(PORT, () => {
-  console.log(`🚀 Production server running on port ${PORT}`);
+  console.log(`🚀 Torrent Stream server running on port ${PORT} (${NODE_ENV})`);
 });

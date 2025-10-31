@@ -1,3 +1,5 @@
+version: "3.9"
+
 services:
   torrent-stream:
     container_name: torrent_stream_server
@@ -8,16 +10,22 @@ services:
     environment:
       NODE_ENV: production
       PORT: 3050
-      OPENSUBTITLES_API_KEY: "RxPfsDLz24QZiE4A4WgwGE2XHcvz4Rng"
-      OPENSUBTITLES_USERNAME: "aung_hein"
-      OPENSUBTITLES_PASSWORD: "Aung2025"
+      OPENSUBTITLES_API_KEY: ${OPENSUBTITLES_API_KEY}
     ports:
       - "3050:3050"
     networks:
       - stream-net
-    tmpfs:
-      - /tmp/webtorrent/tmp  
+    volumes:
+      - torrent-data:/tmp/webtorrent/tmp
+    deploy:
+      resources:
+        limits:
+          memory: 1G
 
 networks:
   stream-net:
     driver: bridge
+
+volumes:
+  torrent-data:
+    driver: local
