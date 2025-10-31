@@ -1,19 +1,17 @@
-
-
-# Dockerfile for torrent-stream app
+# Base image
 FROM node:20-slim
 
 WORKDIR /usr/src/app
 
-# Copy package files and install dependencies
+# Install dependencies
 COPY package*.json ./
-RUN npm install --production
+RUN npm ci --only=production
 
-# Copy source files
+# Copy source
 COPY . .
 
-# Expose app port
+# Use a smaller memory footprint
+ENV NODE_ENV=production
 EXPOSE 3050
 
-# Start the app
 CMD ["node", "--max-old-space-size=512", "server.mjs"]
