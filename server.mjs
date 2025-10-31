@@ -27,6 +27,7 @@ const client = new WebTorrent({
 // --- Caches ---
 const torrentMap = new Map(); 
 const subtitleCache = new NodeCache({ stdTTL: 86400 }); 
+const liveMatchesCache = new NodeCache({ stdTTL: 60 }); // 1 minute cache for live matches
 
 const OPENSUBTITLES_API_KEY = "RxPfsDLz24QZiE4A4WgwGE2XHcvz4Rng";
 
@@ -52,6 +53,456 @@ function rateLimit(req, res, next) {
 }
 
 app.use(rateLimit);
+
+// --- Team Matching Utilities ---
+const TEAM_ALIASES = [
+  // AFC Champions League Teams
+  { primary: "Gangwon FC", aliases: ["gangwon"] },
+  { primary: "Vissel Kobe", aliases: ["vissel kobe"] },
+  { primary: "Shanghai Shenhua FC", aliases: ["shanghai shenhua"] },
+  { primary: "FC Seoul", aliases: ["fc seoul", "seoul"] },
+  { primary: "Gamba Osaka", aliases: ["gamba osaka"] },
+  { primary: "Thep Xanh Nam Dinh FC", aliases: ["nam dinh fc", "thep xanh nam dinh"] },
+  { primary: "Ratchaburi FC", aliases: ["ratchaburi"] },
+  { primary: "Eastern", aliases: ["eastern"] },
+  
+  // UEFA Champions League Teams
+  { primary: "Athletic Club", aliases: ["athletic bilbao", "bilbao"] },
+  { primary: "Qarabag", aliases: ["qarabag fk", "fk qarabag"] },
+  { primary: "Galatasaray", aliases: ["galatasaray"] },
+  { primary: "Bodo Glimt", aliases: ["bodo glimt"] },
+  { primary: "Chelsea", aliases: ["chelsea"] },
+  { primary: "AFC Ajax", aliases: ["ajax", "afc ajax"] },
+  { primary: "Eintracht Frankfurt", aliases: ["eintracht frankfurt"] },
+  { primary: "Liverpool", aliases: ["liverpool"] },
+  { primary: "AS Monaco", aliases: ["as monaco", "monaco"] },
+  { primary: "Tottenham Hotspur", aliases: ["tottenham", "tottenham hotspur"] },
+  { primary: "Atalanta", aliases: ["atalanta"] },
+  { primary: "Slavia Praha", aliases: ["slavia praha"] },
+  { primary: "Real Madrid", aliases: ["real madrid"] },
+  { primary: "Juventus", aliases: ["juventus"] },
+  { primary: "FC Bayern Munich", aliases: ["bayern munchen", "bayern munich", "fc bayern munich"] },
+  { primary: "Club Brugge", aliases: ["club brugge"] },
+  { primary: "Sporting CP", aliases: ["sporting lisbon", "sporting cp"] },
+  { primary: "Marseille", aliases: ["marseille"] },
+
+  // Other notable teams
+  { primary: "Al Nassr FC", aliases: ["al nassr riyadh", "al nassr"] },
+  { primary: "FC Goa", aliases: ["fc goa"] },
+  { primary: "Esteghlal Tehran", aliases: ["esteghlal"] },
+  { primary: "Al Wehdat", aliases: ["al wehdat amman"] },
+  { primary: "Al-Ahli Doha", aliases: ["al ahli doha"] },
+  { primary: "Arkadag FK", aliases: ["fk arkadag"] },
+  { primary: "Persib Bandung", aliases: ["persib bandung"] },
+  { primary: "Selangor FC", aliases: ["selangor"] },
+  { primary: "BG Pathum United", aliases: ["bg pathum united"] },
+  { primary: "Beijing Guoan FC", aliases: ["beijing guoan fc"] },
+  { primary: "Pohang Steelers", aliases: ["pohang steelers"] },
+
+  // Indonesian Teams
+  { primary: "PSIM Yogyakarta", aliases: ["psim yogyakarta"] },
+  { primary: "Dewa United FC", aliases: ["dewa united fc"] },
+];
+
+const LEAGUE_MAPPINGS = {
+  "ACL Elite": ["afc champions league elite", "acl elite"],
+  "ACL2": ["afc champions league two", "acl2"],
+  "UEFA CL": ["uefa champions league", "champions league"],
+  "UEFA YL": ["uefa youth league"],
+  "IDN D1": ["indonesia super league", "indonesia liga 1"],
+  "TUR D1": ["turkey super league", "super lig"],
+  "EGY D1": ["egypt premier league"],
+  "FIN D1": ["finland veikkausliiga"],
+  "RUS Cup": ["russia cup"],
+  "NBA": ["nba"],
+  "NBL": ["nbl"],
+  "KBL": ["kbl"],
+  "MPBL": ["mpbl"],
+};
+
+function normalizeTeamName(name) {
+  if (!name) return '';
+  
+  return name
+    .toLowerCase()
+    .replace(/[^a-z0-9 ]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function normalizeLeagueName(name) {
+  if (!name) return '';
+  
+  return name
+    .toLowerCase()
+    .replace(/[^a-z0-9 ]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function findTeamMatch(teamName) {
+  const normalized = normalizeTeamName(teamName);
+  
+  for (const team of TEAM_ALIASES) {
+    // Check primary name
+    if (normalizeTeamName(team.primary) === normalized) {
+      return team.primary;
+    }
+    
+    // Check aliases
+    for (const alias of team.aliases) {
+      if (normalizeTeamName(alias) === normalized) {
+        return team.primary;
+      }
+    }
+  }
+  
+  return teamName; // Return original if no match found
+}
+
+function findLeagueMatch(leagueName) {
+  const normalized = normalizeLeagueName(leagueName);
+  
+  for (const [key, aliases] of Object.entries(LEAGUE_MAPPINGS)) {
+    if (aliases.some(alias => normalizeLeagueName(alias) === normalized)) {
+      return key;
+    }
+  }
+  
+  return leagueName; // Return original if no match found
+}
+
+function calculateSimilarity(a, b) {
+  const aNorm = normalizeTeamName(a);
+  const bNorm = normalizeTeamName(b);
+  
+  if (aNorm === bNorm) return 1.0;
+  
+  const aWords = new Set(aNorm.split(' '));
+  const bWords = new Set(bNorm.split(' '));
+  
+  let intersection = 0;
+  for (const word of aWords) {
+    if (bWords.has(word)) intersection++;
+  }
+  
+  const union = new Set([...aWords, ...bWords]).size;
+  return union > 0 ? intersection / union : 0;
+}
+
+// --- Live Matches Constants ---
+const RESULT_PARENT_URL = "https://sport.ibet288.com/_view/Result.aspx";
+const BASE_URL = "https://json.vnres.co";
+
+// --- Live Matches API ---
+app.get("/live", async (req, res) => {
+  try {
+    // Check cache first
+    const cached = liveMatchesCache.get('matches');
+    if (cached) {
+      return res.json(cached);
+    }
+
+    const dates = [
+      formatDate(Date.now()),
+      formatDate(Date.now() + 72_000_000), // 20 hours ahead
+    ];
+
+    const ibetResults = await getCachedIbetResults();
+    const matchGroups = await Promise.all(
+      dates.map((d) => fetchMatches(d, ibetResults))
+    );
+
+    const allMatches = matchGroups.flat();
+    
+    // Cache the results for 1 minute
+    liveMatchesCache.set('matches', allMatches, 60);
+
+    res.json(allMatches);
+  } catch (err) {
+    console.error("[API] Live fetch error:", err);
+    res.status(500).json({ 
+      error: "Server error", 
+      message: err.message 
+    });
+  }
+});
+
+// --- Live Matches Helpers ---
+function formatDate(ms) {
+  const dt = new Date(ms);
+  const formatted = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Yangon" }).format(dt);
+  return formatted.replace(/-/g, "");
+}
+
+let ibetCache = null;
+
+async function getCachedIbetResults() {
+  const now = Date.now();
+  if (ibetCache && now - ibetCache.timestamp < 3 * 60 * 1000) {
+    return ibetCache.data;
+  }
+  
+  try {
+    const results = await fetchIbetResults();
+    ibetCache = { timestamp: now, data: results };
+    return results;
+  } catch (error) {
+    console.warn("⚠️ iBet fetch failed, using cache if available:", error);
+    return ibetCache?.data || [];
+  }
+}
+
+async function fetchIbetResults() {
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
+
+    const res = await fetch(RESULT_PARENT_URL, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Referer": "https://www.google.com/",
+      },
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+
+    const html = await res.text();
+    const tableMatch = html.match(/<table[^>]*id="g1"[^>]*>([\s\S]*?)<\/table>/i);
+    if (!tableMatch) return [];
+
+    const rows = tableMatch[1].split(/<\/tr>/i);
+    let currentLeague = "";
+    const scores = [];
+
+    for (const row of rows) {
+      if (/class="?Event"?/i.test(row)) {
+        const league = row.replace(/<[^>]+>/g, "").trim();
+        if (league) currentLeague = league;
+      } else if (/class="?Normal"?/i.test(row)) {
+        const cols = row.split(/<\/td>/i).map((c) => c.replace(/<[^>]+>/g, "").trim());
+        if (cols.length >= 5 && cols[1] && cols[3]) {
+          scores.push({
+            league: applyAliases(currentLeague),
+            home: applyAliases(cols[1]),
+            away: applyAliases(cols[3]),
+            ft: cols[2] || null,
+            ht: cols[4] || null,
+          });
+        }
+      }
+    }
+
+    return scores;
+  } catch (err) {
+    console.warn("⚠️ iBet fetch failed:", err.message);
+    return [];
+  }
+}
+
+async function fetchMatches(date, ibetResults) {
+  const cacheKey = `matches_${date}`;
+  const cached = liveMatchesCache.get(cacheKey);
+  if (cached && Date.now() - cached.timestamp < 120_000) {
+    return cached.data;
+  }
+
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 15000);
+
+    const res = await fetch(`${BASE_URL}/match/matches_${date}.json`, {
+      headers: { 
+        referer: "https://socolivev.co/", 
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        origin: BASE_URL 
+      },
+      signal: controller.signal,
+      cache: "no-store",
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+
+    const txt = await res.text();
+    const m = txt.match(/matches_\d+\((.*)\)/);
+    if (!m) return [];
+
+    const js = JSON.parse(m[1]);
+    if (js.code !== 200) return [];
+
+    const now = Math.floor(Date.now() / 1000);
+    const results = await Promise.all(
+      js.data.map(async (it) => {
+        const mt = Math.floor(it.matchTime / 1000);
+        const status =
+          now >= mt && now <= mt + 7200 ? "live" : now > mt + 7200 ? "finished" : "vs";
+
+        const ibet = findIbetScore(ibetResults, it.subCateName, it.hostName, it.guestName);
+        const match_score =
+          ibet.ft && ibet.ft !== "-"
+            ? ibet.ft
+            : it.homeScore != null && it.awayScore != null
+            ? `${it.homeScore} - ${it.awayScore}`
+            : null;
+        const ht_score = ibet.ht && ibet.ht !== "-" ? ibet.ht : null;
+
+        const servers = status === "live" ? await fetchAllServerURLs(it.anchors) : [];
+
+        const ibetMatchStatus = ibet.ft || ibet.ht ? "FOUND" : "NOT_FOUND";
+
+        return {
+          match_time: formatMatchTime(mt),
+          match_status: status,
+          home_team_name: it.hostName,
+          home_team_logo: it.hostIcon,
+          away_team_name: it.guestName,
+          away_team_logo: it.guestIcon,
+          league_name: it.subCateName,
+          match_score,
+          ht_score,
+          servers,
+          debug: {
+            original_league: it.subCateName,
+            original_home: it.hostName,
+            original_away: it.guestName,
+            ibet_match: ibetMatchStatus,
+          },
+        };
+      })
+    );
+
+    liveMatchesCache.set(cacheKey, { timestamp: Date.now(), data: results });
+    return results;
+  } catch (err) {
+    console.warn(`⚠️ VNRes ${date} error:`, err.message);
+    return liveMatchesCache.get(cacheKey)?.data || [];
+  }
+}
+
+async function fetchAllServerURLs(anchors) {
+  const results = [];
+  
+  if (!anchors || anchors.length === 0) {
+    return results;
+  }
+
+  await Promise.allSettled(
+    anchors.map(async (a) => {
+      if (!a.anchor?.roomNum) return;
+      
+      try {
+        const s = await fetchServerURL(a.anchor.roomNum);
+        if (s.m3u8) results.push({ name: "480p", stream_url: s.m3u8 });
+        if (s.hdM3u8) results.push({ name: "1080p", stream_url: s.hdM3u8 });
+      } catch (error) {
+        console.warn(`Failed to fetch server URL for room ${a.anchor.roomNum}:`, error);
+      }
+    })
+  );
+  
+  return results;
+}
+
+async function fetchServerURL(roomNum) {
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
+
+    const res = await fetch(`https://json.vnres.co/room/${roomNum}/detail.json`, {
+      signal: controller.signal,
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://socolivev.co/",
+        "Origin": "https://socolivev.co",
+      },
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+
+    const txt = await res.text();
+    const m = txt.match(/detail\((.*)\)/);
+    if (!m) return { m3u8: null, hdM3u8: null };
+    
+    const js = JSON.parse(m[1]);
+    return { 
+      m3u8: js.data?.stream?.m3u8 ?? null, 
+      hdM3u8: js.data?.stream?.hdM3u8 ?? null 
+    };
+  } catch {
+    return { m3u8: null, hdM3u8: null };
+  }
+}
+
+function formatMatchTime(unixSeconds) {
+  const dt = new Date(unixSeconds * 1000);
+  const formatted = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Yangon",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: true,
+  }).format(dt);
+  return formatted;
+}
+
+function normalizeName(s) {
+  return (s || "").toLowerCase().replace(/\s+/g, " ").replace(/[^a-z0-9 ]/g, "").trim();
+}
+
+const ALIASES = {
+  sg: "super giant",
+  acl2: "afc champions league 2",
+  utd: "united",
+  mun: "manchester united",
+};
+
+function applyAliases(raw) {
+  return normalizeName(raw)
+    .split(" ")
+    .map((w) => ALIASES[w] ?? w)
+    .join(" ");
+}
+
+function findIbetScore(ibetResults, league, home, away) {
+  if (!ibetResults || ibetResults.length === 0) {
+    return { ft: null, ht: null };
+  }
+
+  const aLeague = applyAliases(findLeagueMatch(league));
+  const aHome = applyAliases(findTeamMatch(home));
+  const aAway = applyAliases(findTeamMatch(away));
+
+  let best = null;
+  let bestScore = 0;
+
+  for (const row of ibetResults) {
+    const score =
+      calculateSimilarity(aLeague, row.league) +
+      calculateSimilarity(aHome, row.home) +
+      calculateSimilarity(aAway, row.away);
+
+    if (score > bestScore) {
+      bestScore = score;
+      best = row;
+    }
+  }
+
+  return best && bestScore >= 0.6 ? { ft: best.ft, ht: best.ht } : { ft: null, ht: null };
+}
 
 // --- Torrent Management ---
 function getTorrent(torrentUrl) {
@@ -93,8 +544,6 @@ setInterval(() => {
   }
 }, 10 * 60 * 1000);
 
-
-
 // --- Enhanced Subtitle Search with Duration Matching ---
 async function searchSubtitles(movieTitle, fileSize, imdbId, duration, lang = "eng") { 
   const cacheKey = `subs_${imdbId}_${lang}_${fileSize}_${duration}`;
@@ -129,7 +578,6 @@ async function searchSubtitles(movieTitle, fileSize, imdbId, duration, lang = "e
     const searchData = await searchResponse.json();
     
     if (searchData.data && searchData.data.length > 0) {
-      // Enhanced matching algorithm with duration consideration
       let bestMatch = findBestSubtitleMatch(searchData.data, fileSize, duration);
       
       if (bestMatch) {
@@ -163,7 +611,6 @@ async function searchSubtitles(movieTitle, fileSize, imdbId, duration, lang = "e
   return null;
 }
 
-// --- Enhanced Subtitle Matching Algorithm ---
 function findBestSubtitleMatch(subtitles, fileSize, duration) {
   if (!subtitles || subtitles.length === 0) return null;
 
@@ -173,58 +620,50 @@ function findBestSubtitleMatch(subtitles, fileSize, duration) {
   for (const subtitle of subtitles) {
     let score = 0;
 
-    // 1. Hash match (highest priority)
     if (subtitle.attributes.movie_hash_match) {
       score += 1000;
     }
 
-    // 2. Duration matching (new - very important)
     if (duration && subtitle.attributes.movie_time_ms) {
-      const subtitleDuration = subtitle.attributes.movie_time_ms / 1000; // Convert to seconds
+      const subtitleDuration = subtitle.attributes.movie_time_ms / 1000;
       const durationDiff = Math.abs(duration - subtitleDuration);
       
-      // Higher score for closer duration matches
-      if (durationDiff < 60) { // Within 1 minute
+      if (durationDiff < 60) {
         score += 500;
-      } else if (durationDiff < 300) { // Within 5 minutes
+      } else if (durationDiff < 300) {
         score += 200;
-      } else if (durationDiff < 600) { // Within 10 minutes
+      } else if (durationDiff < 600) {
         score += 50;
       }
       
-      // Bonus for exact duration match
       if (durationDiff < 10) {
         score += 300;
       }
     }
 
-    // 3. File size matching
     if (fileSize && subtitle.attributes.size) {
       const sizeDiff = Math.abs(fileSize - subtitle.attributes.size);
       const sizeRatio = Math.min(fileSize, subtitle.attributes.size) / Math.max(fileSize, subtitle.attributes.size);
       
-      if (sizeRatio > 0.95) { // Within 5% size difference
+      if (sizeRatio > 0.95) {
         score += 300;
-      } else if (sizeRatio > 0.90) { // Within 10% size difference
+      } else if (sizeRatio > 0.90) {
         score += 150;
-      } else if (sizeRatio > 0.80) { // Within 20% size difference
+      } else if (sizeRatio > 0.80) {
         score += 50;
       }
     }
 
-    // 4. Download count (popularity)
     if (subtitle.attributes.download_count) {
       score += Math.log10(subtitle.attributes.download_count + 1) * 10;
     }
 
-    // 5. Frame rate matching
     if (subtitle.attributes.fps) {
-      score += 20; // Bonus for having FPS info
+      score += 20;
     }
 
-    // 6. Format preferences
     if (subtitle.attributes.format === 'srt') {
-      score += 10; // Prefer SRT format
+      score += 10;
     }
 
     if (score > bestScore) {
@@ -302,7 +741,6 @@ app.get("/subs", async (req, res) => {
 
     if (!file) return res.status(404).json({ error: "No video file" });
 
-    // Parse duration to number
     const videoDuration = duration ? parseFloat(duration) : null;
 
     let subtitleContent = await searchSubtitles(
@@ -315,8 +753,6 @@ app.get("/subs", async (req, res) => {
 
     if (subtitleContent) {
       const offsetSeconds = parseFloat(offset) || 0;
-      
-      // Apply time offset
       subtitleContent = applyTimeOffset(subtitleContent, offsetSeconds);
 
       res.setHeader("Content-Type", "text/vtt");
@@ -347,7 +783,6 @@ app.get("/stream/status", async (req, res) => {
   return res.json({ status: "ready" });
 });
 
-
 // --- Available Subtitle Languages ---
 app.get("/subs/languages", async (req, res) => {
   try {
@@ -359,8 +794,6 @@ app.get("/subs/languages", async (req, res) => {
 });
 
 // --- Helpers ---
-
-// Time Offset Helper
 function applyTimeOffset(vttContent, offsetSeconds) {
     if (offsetSeconds === 0 || typeof vttContent !== 'string') return vttContent;
 
@@ -372,9 +805,9 @@ function applyTimeOffset(vttContent, offsetSeconds) {
         let totalSeconds = 0;
         let ms = parts.pop() / 1000;
         
-        if (parts.length === 2) { // MM:SS
+        if (parts.length === 2) {
             totalSeconds = parts[0] * 60 + parts[1];
-        } else if (parts.length === 3) { // HH:MM:SS
+        } else if (parts.length === 3) {
             totalSeconds = parts[0] * 3600 + parts[1] * 60 + parts[2];
         }
         return totalSeconds + ms;
@@ -405,7 +838,6 @@ function applyTimeOffset(vttContent, offsetSeconds) {
     });
 }
 
-// VTT Conversion Helper
 function convertSrtToVtt(srt) {
   let vtt = "WEBVTT\n\n";
 
@@ -433,6 +865,5 @@ app.get("/health", (req, res) => {
 const PORT = process.env.PORT || 3050;
 app.listen(PORT, () => {
   console.log(`🚀 Production server running on port ${PORT}`);
+  console.log(`📺 Live matches available at: http://localhost:${PORT}/live`);
 });
-
-
