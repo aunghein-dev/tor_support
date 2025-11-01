@@ -852,6 +852,109 @@ function convertSrtToVtt(srt) {
   return vtt;
 }
 
+
+// --- Download Route for Encoded Video ---
+app.get("/download", async (req, res) => {
+  try {
+    const { 
+      torrent: torrentUrl, 
+      quality, 
+      title, 
+      imdbId, 
+      type = "video/mp4" 
+    } = req.query;
+
+    if (!torrentUrl) {
+      return res.status(400).json({ error: "No torrent URL provided" });
+    }
+
+    console.log(`📥 Download request for: ${title} (${quality})`);
+    const torrent = await getTorrent(torrentUrl);
+    
+    const file = torrent.files.find(f =>
+      /\.(mp4|mkv|avi|mov|wmv|flv|webm)$/i.test(f.name)
+    ) || torrent.files[0];
+
+    if (!file) {
+      return res.status(404).json({ error: "No video file found in torrent" });
+    }
+
+    const safeTitle = (title || file.name)
+      .replace(/[^a-zA-Z0-9\s\-\.]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    
+    const fileExtension = file.name.split('.').pop() || 'mp4';
+    const filename = `${safeTitle} (${quality}).${fileExtension}`;
+
+    res.setHeader('Content-Type', type);
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Content-Length', file.length);
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Accept-Ranges', 'bytes');
+
+    console.log(`⬇️ Starting download: ${filename} (${file.length} bytes)`);
+
+    const range = req.headers.range;
+    if (range) {
+      const fileSize = file.length;
+      const parts = range.replace(/bytes=/, "").split("-");
+      const start = parseInt(parts[0], 10);
+      const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+      const chunksize = (end - start) + 1;
+
+      res.writeHead(206, {
+        'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+        'Accept-Ranges': 'bytes',
+        'Content-Length': chunksize,
+        'Content-Type': type,
+        'Content-Disposition': `attachment; filename="${filename}"`
+      });
+
+      const stream = file.createReadStream({ start, end });
+      stream.on("error", (error) => {
+        console.error('Stream error during download:', error);
+        if (!res.headersSent) {
+          res.status(500).json({ error: "Stream error during download" });
+        }
+      });
+      
+      res.on("close", () => {
+        stream.destroy();
+        console.log(`Download stream closed for: ${filename}`);
+      });
+      
+      return stream.pipe(res);
+    }
+
+    const stream = file.createReadStream();
+    
+    stream.on("error", (error) => {
+      console.error('Stream error during download:', error);
+      if (!res.headersSent) {
+        res.status(500).json({ error: "Stream error during download" });
+      }
+    });
+
+    res.on("close", () => {
+      stream.destroy();
+      console.log(`Download completed for: ${filename}`);
+    });
+
+    stream.pipe(res);
+
+  } catch (error) {
+    console.error('Download error:', error);
+    
+    if (!res.headersSent) {
+      res.status(500).json({ 
+        error: "Download failed", 
+        message: error instanceof Error ? error.message : "Unknown error" 
+      });
+    }
+  }
+});
+
 // --- Health Check ---
 app.get("/health", (req, res) => {
   res.json({ 
