@@ -505,6 +505,7 @@ function findIbetScore(ibetResults, league, home, away) {
 }
 
 // --- Torrent Management ---
+/*
 function getTorrent(torrentUrl) {
   return new Promise((resolve, reject) => {
     const cacheKey = `torrent_${Buffer.from(torrentUrl).toString('base64')}`;
@@ -532,6 +533,83 @@ function getTorrent(torrentUrl) {
 
   });
 }
+  */
+
+function getTorrent(torrentUrl) {
+  return new Promise((resolve, reject) => {
+    // Decode the URL first to handle any double-encoding
+    try {
+      torrentUrl = decodeURIComponent(torrentUrl);
+    } catch (e) {
+      console.log('URL was not encoded, using as-is');
+    }
+
+    const cacheKey = `torrent_${Buffer.from(torrentUrl).toString('base64')}`;
+
+    if (torrentMap.has(cacheKey)) {
+      const cached = torrentMap.get(cacheKey);
+      cached.lastAccessed = Date.now();
+      return resolve(cached.torrent);
+    }
+
+    // Validate torrent URL before adding
+    if (!torrentUrl || (typeof torrentUrl === 'string' && torrentUrl.trim().length === 0)) {
+      return reject(new Error('Invalid torrent URL: empty or null'));
+    }
+
+    let torrent;
+    try {
+      // Try different methods to add the torrent
+      if (torrentUrl.startsWith('magnet:')) {
+        torrent = client.add(torrentUrl, {
+          path: path.join(os.tmpdir(), 'webtorrent', Date.now().toString()),
+          storeCacheSlots: 30
+        });
+      } else if (torrentUrl.startsWith('http')) {
+        // For HTTP URLs, let WebTorrent handle the download
+        torrent = client.add(torrentUrl, {
+          path: path.join(os.tmpdir(), 'webtorrent', Date.now().toString()),
+          storeCacheSlots: 30
+        });
+      } else {
+        // Assume it's a info hash or other identifier
+        torrent = client.add(torrentUrl, {
+          path: path.join(os.tmpdir(), 'webtorrent', Date.now().toString()),
+          storeCacheSlots: 30
+        });
+      }
+    } catch (error) {
+      console.error('Error adding torrent:', error);
+      return reject(new Error(`Failed to add torrent: ${error.message}`));
+    }
+
+    const wrapper = { torrent, lastAccessed: Date.now() };
+    torrentMap.set(cacheKey, wrapper);
+
+    torrent.on('ready', () => {
+      console.log(`✅ Torrent ready: ${torrent.name}`);
+      resolve(torrent);
+    });
+    
+    torrent.on('error', (err) => {
+      console.error('Torrent error:', err);
+      torrentMap.delete(cacheKey);
+      reject(err);
+    });
+
+    // Timeout for torrent readiness
+    const timeout = setTimeout(() => {
+      torrentMap.delete(cacheKey);
+      reject(new Error('Torrent readiness timeout'));
+    }, 30000); // 30 second timeout
+
+    torrent.on('ready', () => {
+      clearTimeout(timeout);
+    });
+
+  });
+}
+
 
 setInterval(() => {
   const now = Date.now();
@@ -852,8 +930,6 @@ function convertSrtToVtt(srt) {
   return vtt;
 }
 
-
-// --- Download Route for Encoded Video ---
 app.get("/download", async (req, res) => {
   try {
     const { 
@@ -869,7 +945,18 @@ app.get("/download", async (req, res) => {
     }
 
     console.log(`📥 Download request for: ${title} (${quality})`);
-    const torrent = await getTorrent(torrentUrl);
+    
+    // Validate and decode torrent URL
+    let decodedTorrentUrl;
+    try {
+      decodedTorrentUrl = decodeURIComponent(torrentUrl);
+      console.log(`🔗 Decoded torrent URL: ${decodedTorrentUrl.substring(0, 100)}...`);
+    } catch (error) {
+      console.log('⚠️ Torrent URL was not encoded, using as-is');
+      decodedTorrentUrl = torrentUrl;
+    }
+
+    const torrent = await getTorrent(decodedTorrentUrl);
     
     const file = torrent.files.find(f =>
       /\.(mp4|mkv|avi|mov|wmv|flv|webm)$/i.test(f.name)
@@ -879,7 +966,7 @@ app.get("/download", async (req, res) => {
       return res.status(404).json({ error: "No video file found in torrent" });
     }
 
-    const safeTitle = (title || file.name)
+    const safeTitle = (title || file.name || 'download')
       .replace(/[^a-zA-Z0-9\s\-\.]/g, '')
       .replace(/\s+/g, ' ')
       .trim();
@@ -887,6 +974,7 @@ app.get("/download", async (req, res) => {
     const fileExtension = file.name.split('.').pop() || 'mp4';
     const filename = `${safeTitle} (${quality}).${fileExtension}`;
 
+    // Set headers for download
     res.setHeader('Content-Type', type);
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
     res.setHeader('Content-Length', file.length);
@@ -895,12 +983,19 @@ app.get("/download", async (req, res) => {
 
     console.log(`⬇️ Starting download: ${filename} (${file.length} bytes)`);
 
+    // Handle range requests for resumable downloads
     const range = req.headers.range;
     if (range) {
       const fileSize = file.length;
       const parts = range.replace(/bytes=/, "").split("-");
       const start = parseInt(parts[0], 10);
       const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+      
+      if (start >= fileSize || end >= fileSize) {
+        res.status(416).setHeader("Content-Range", `bytes */${fileSize}`);
+        return res.end();
+      }
+
       const chunksize = (end - start) + 1;
 
       res.writeHead(206, {
@@ -927,6 +1022,7 @@ app.get("/download", async (req, res) => {
       return stream.pipe(res);
     }
 
+    // Full file download
     const stream = file.createReadStream();
     
     stream.on("error", (error) => {
@@ -936,30 +1032,49 @@ app.get("/download", async (req, res) => {
       }
     });
 
+    stream.on("end", () => {
+      console.log(`✅ Download completed for: ${filename}`);
+    });
+
     res.on("close", () => {
       stream.destroy();
-      console.log(`Download completed for: ${filename}`);
+      console.log(`Download interrupted for: ${filename}`);
     });
 
     stream.pipe(res);
 
   } catch (error) {
-    console.error('Download error:', error);
+    console.error('❌ Download error:', error);
     
     if (!res.headersSent) {
       res.status(500).json({ 
         error: "Download failed", 
-        message: error instanceof Error ? error.message : "Unknown error" 
+        message: error instanceof Error ? error.message : "Unknown error",
+        details: "Check if the torrent link is valid and accessible"
       });
     }
   }
 });
 
-// --- Health Check ---
+
+client.on('error', (err) => {
+  console.error('WebTorrent client error:', err);
+});
+
 app.get("/health", (req, res) => {
+  const torrentInfo = client.torrents.map(t => ({
+    name: t.name,
+    progress: t.progress,
+    ready: t.ready,
+    numPeers: t.numPeers,
+    downloadSpeed: t.downloadSpeed,
+    uploadSpeed: t.uploadSpeed
+  }));
+
   res.json({ 
     status: "healthy", 
     torrents: client.torrents.length,
+    activeTorrents: torrentInfo,
     memory: process.memoryUsage(),
     uptime: process.uptime()
   });
